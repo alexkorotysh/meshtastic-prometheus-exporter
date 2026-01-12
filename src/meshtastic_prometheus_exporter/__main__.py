@@ -118,6 +118,36 @@ handler.setFormatter(
 
 logger.addHandler(handler)
 
+# Monkeypatch TCP write to handle BrokenPipeError/OSError inside meshtastic threads.
+# This prevents unhandled BrokenPipeError from terminating background threads
+# and allows our `on_native_connection_lost` handler to run and trigger reconnection.
+try:
+    _orig_tcp_write = meshtastic.tcp_interface.TCPInterface._writeBytes
+
+    def _safe_tcp_write(self, b):
+        try:
+            return _orig_tcp_write(self, b)
+        except (BrokenPipeError, OSError) as e:
+            logger.warning(
+                f"TCP write failed with {e!r}; closing socket and notifying connection lost"
+            )
+            try:
+                if hasattr(self, "socket") and self.socket is not None:
+                    try:
+                        self.socket.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    pub.sendMessage("meshtastic.connection.lost", interface=self)
+                except Exception:
+                    pass
+
+    meshtastic.tcp_interface.TCPInterface._writeBytes = _safe_tcp_write
+except Exception:
+    # If monkeypatching fails, continue without it — best-effort.
+    pass
+
 try:
     reader = PrometheusMetricReader()
     start_http_server(
